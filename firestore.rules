@@ -1,0 +1,156 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =========================================================================
+    // 1. DEFAULT DENY-ALL (Firebase Security Checklist Best Practice)
+    // =========================================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // 2. HELPER FUNCTIONS FOR AUTH & SCHEMA VALIDATION
+    // =========================================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isNonEmptyString(val, maxLen) {
+      return val is string && val.size() > 0 && val.size() <= maxLen;
+    }
+
+    function isPositiveNumber(val) {
+      return (val is int || val is float) && val > 0;
+    }
+
+    function isNonNegativeNumber(val) {
+      return (val is int || val is float) && val >= 0;
+    }
+
+    function isValidISODate(val) {
+      return val is string && val.matches('^\\d{4}-\\d{2}-\\d{2}.*$');
+    }
+
+    // =========================================================================
+    // 3. USER ROOT & SUBCOLLECTIONS (/users/{userId}/...)
+    // =========================================================================
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow create, update: if isOwner(userId)
+        && request.resource.data.keys().hasAll(['email', 'updatedAt']);
+      allow delete: if false; // Prevent accidental full profile deletion
+
+      // -----------------------------------------------------------------------
+      // Physical Accounts (/users/{userId}/accounts/{accountId})
+      // -----------------------------------------------------------------------
+      match /accounts/{accountId} {
+        allow read: if isOwner(userId);
+        allow create, update: if isOwner(userId)
+          && isNonEmptyString(request.resource.data.name, 100)
+          && (request.resource.data.balance is int || request.resource.data.balance is float)
+          && request.resource.data.type in ['checking', 'savings', 'investment', 'vault'];
+        allow delete: if isOwner(userId);
+      }
+
+      // -----------------------------------------------------------------------
+      // Income Transactions (/users/{userId}/incomes/{incomeId})
+      // Enforces positive amount, valid date, and non-empty source
+      // -----------------------------------------------------------------------
+      match /incomes/{incomeId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId)
+          && isPositiveNumber(request.resource.data.amount)
+          && isValidISODate(request.resource.data.date)
+          && isNonEmptyString(request.resource.data.source, 120)
+          && request.resource.data.status == 'active'
+          && request.resource.data.appliedAllocations is list;
+        // Updates are restricted to soft-delete ("undo") status transitions
+        allow update: if isOwner(userId)
+          && request.resource.data.amount == resource.data.amount
+          && request.resource.data.date == resource.data.date
+          && request.resource.data.status in ['active', 'undone'];
+        allow delete: if false; // Enforce soft-delete (undo) for auditability
+      }
+
+      // -----------------------------------------------------------------------
+      // Expense Transactions (/users/{userId}/expenses/{expenseId})
+      // Enforces positive amount, valid date, category, and soft-delete undo
+      // -----------------------------------------------------------------------
+      match /expenses/{expenseId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId)
+          && isPositiveNumber(request.resource.data.amount)
+          && isValidISODate(request.resource.data.date)
+          && isNonEmptyString(request.resource.data.category, 80)
+          && request.resource.data.status == 'active';
+        allow update: if isOwner(userId)
+          && request.resource.data.amount == resource.data.amount
+          && request.resource.data.status in ['active', 'undone'];
+        allow delete: if false; // Enforce soft-delete (undo) for auditability
+      }
+
+      // -----------------------------------------------------------------------
+      // Funds & Sinking Goals (/users/{userId}/funds/{fundId})
+      // -----------------------------------------------------------------------
+      match /funds/{fundId} {
+        allow read: if isOwner(userId);
+        allow create, update: if isOwner(userId)
+          && isNonEmptyString(request.resource.data.name, 100)
+          && request.resource.data.type in ['percentage', 'monthly', 'sinking', 'target']
+          && isNonNegativeNumber(request.resource.data.reservedAmount)
+          && isNonNegativeNumber(request.resource.data.cycleAllocated);
+        allow delete: if isOwner(userId)
+          && resource.data.reservedAmount == 0;
+      }
+
+      // -----------------------------------------------------------------------
+      // Allocation Records (/users/{userId}/allocations/{allocationId})
+      // Links incomeId -> fundId with amount and ruleUsed
+      // -----------------------------------------------------------------------
+      match /allocations/{allocationId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId)
+          && isNonEmptyString(request.resource.data.incomeId, 100)
+          && isNonEmptyString(request.resource.data.fundId, 100)
+          && isNonNegativeNumber(request.resource.data.amount)
+          && isNonEmptyString(request.resource.data.ruleUsed, 250)
+          && isValidISODate(request.resource.data.timestamp);
+        allow update: if isOwner(userId)
+          && request.resource.data.amount == resource.data.amount
+          && request.resource.data.status in ['active', 'undone'];
+        allow delete: if false;
+      }
+
+      // -----------------------------------------------------------------------
+      // Chronological Audit Trail (/users/{userId}/auditLogs/{logId})
+      // Append-only ledger so CFO / User audit history cannot be tampered with
+      // -----------------------------------------------------------------------
+      match /auditLogs/{logId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId)
+          && isNonEmptyString(request.resource.data.action, 80)
+          && isValidISODate(request.resource.data.timestamp);
+        allow update, delete: if false;
+      }
+
+      // -----------------------------------------------------------------------
+      // Singleton Settings Document (/users/{userId}/settings/{docId})
+      // -----------------------------------------------------------------------
+      match /settings/{docId} {
+        // `request.resource` only exists on WRITES. The schema check below therefore must not be attached to
+        // `read`: evaluating it on a read raises "Property resource is undefined" and denies the read, which
+        // broke the settings listener, Add Income, Working Capital spending and the month rollover.
+        allow read: if isOwner(userId);
+        allow create, update: if isOwner(userId)
+          && request.resource.data.surplusStrategy in ['unallocated', 'proportional_rules'];
+        allow delete: if false;
+      }
+    }
+  }
+}
